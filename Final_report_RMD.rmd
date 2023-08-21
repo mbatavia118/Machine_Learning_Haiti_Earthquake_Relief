@@ -1,0 +1,1414 @@
+---
+title: 'Disaster Relief Project: Part 2'
+author: "Mariska Batavia"
+date: '2022-08-06'
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(tidyverse)
+library(reshape2)
+library(caret)
+library(boot)
+library(broom)
+library(ROCR)
+library(parallel)
+library(doParallel)
+```
+
+
+## Introduction
+
+The purpose of this project was to use aerial photographs of Haiti after the destructive 2010 earthquake to locate blue tarps, which are indicative of displaced persons in need of humanitarian aid. The training data set consisted of 63,241 individual pixels, each with a red, green, and blue color value (all numeric), as well as a class assignment that indicated whether a pixel was a blue tarp, vegetation, soil, rooftop, or something else. Using this data set, I built seven classification models using different methods: logistic regression, linear discriminant analysis, quadratic discriminant analysis, K-nearest neighbor, penalized fit logistic regression (ridge regression), random forest, and the support vector machine. I then tested these seven models on a larger holdout data set of over 2 million individual pixels.  
+
+
+## Data Wrangling and Exploratory Data Analysis
+
+My first step was to import the data and convert the "Class" variable to a factor with five levels. I also created a variable called "tarp," which collapses the levels of "Class" into a binary outcome: either the pixel is a blue tarp and has a value of "tarp," or it is any of the other four categories in "Class", and has a value of "other."
+```{r}
+#import the data
+haiti <- read.csv("HaitiPixels.csv", header=TRUE)
+
+#convert class to factor
+haiti$Class <- factor(haiti$Class)
+
+#create a binary variable to identify blue tarp (yes/no)
+haiti <- haiti%>%
+  mutate(tarp=fct_collapse(Class, tarp=c("Blue Tarp"), 
+                           other=c("Vegetation", "Soil", "Rooftop", 
+                                   "Various Non-Tarp")))
+
+```
+
+Next, I checked for any pixels with missing values; there were none.
+
+```{r}
+#return rows with missing values
+haiti[!complete.cases(haiti),]
+```
+
+I looked at a simple summary of each variable in the data set, as well as a correlation matrix for all three colors, shown below. Blue tarps are the least numerous category, making up only (2022/(61219+2022)) = 3.2% of all pixels. Most pixels are coded as soil or vegetation. All three color values have a maximum of 255 (which is the maximum possible), but the lowest values are 48 (red and green) and 44 (blue). Color values are highly correlated.
+
+```{r}
+summary(haiti)
+```
+```{r}
+round((cor(haiti[2:4])), 2)
+```
+
+
+From the boxplots and density plots below, I noted that pixels coded as blue tarps have substantially higher median blue and green color values as compared to pixels coded as other categories. Red color values had similar median values in both classes of pixels, though from the density plot, it appears that there is a bimodal distribution of values for pixels that are not tarps. Indeed, though the green values are lower, on average, in non-tarp pixels, they also show a similar bimodal distribution. For all three colors, the range of values was much narrower in blue tarp pixels than in pixels coded as other categories. This is unsurprising, since non-blue tarp pixels span four different categories (vegetation, soil, rooftops, and various non-tarp).
+
+```{r}
+#long pivot for side-by-side plots
+
+long <- haiti[,2:5]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#boxplot with color as facet wrap
+ggplot(long, aes(x=tarp, y=Value)) +
+  geom_boxplot() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Class", y="Color Value", 
+       title = "Boxplot: Color Values for Blue Tarp versus Other")
+```
+```{r}
+#density plots with color as facet wrap
+p <- ggplot(long, aes(x=Value, color=tarp)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot: Color Values for Blue Tarp versus Other", 
+       color="Pixel Classification")
+
+#manually change the color of the lines
+p+scale_color_manual(values=c("blue", "black"))
+```
+
+
+Plotting color values across all five original categories (below), it appears that blue tarp pixels have notably higher blue color values than other categories, but there is substantial overlap with other categories in red and green color values. For instance, rooftops have similar green color values (in terms of both median and IQR) compared to blue tarps, and their density plots greatly overlap. Two other observations worth noting are first, that vegetation appears to have low values for red, green, and blue, suggesting those pixels are darker overall. Second, the density plots show that a majority of soil pixels have very high green and red values.
+
+
+```{r}
+#long pivot for side-by-side plots
+long2 <- haiti[,1:4]%>%
+  pivot_longer(cols=-Class, names_to = "Color", values_to = "Value")
+
+#ggplot with color as facet wrap
+ggplot(long2, aes(x=Class, y=Value)) +
+  geom_boxplot() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Class", y="Color Value", title = "Boxplot: Color Values Across Pixel Classes")+
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r}
+#density plots with color as facet wrap
+p2 <- ggplot(long2, aes(x=Value, color=Class)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot: Color Values Across Pixel Classes", 
+       color="Pixel Classification")
+
+#manually change the color of the lines
+p2 + scale_color_manual(values=c("blue", "brown", "red", "black", "green"))
+```
+
+
+I randomly sampled 5000 observations from the data set and created a scatter plot matrix (below). Looking at this matrix, we can see that all pairs of color values are positively correlated, as noted previously. Pixels with low values for one color tend to have low values for other colors, though in higher value ranges, there is more variation. Many blue tarp pixels stand out in having relatively high blue values for a given green or red value. Separation of other classes is not always as clear. Vegetation (orange on this plot) stands out as having low color values, as noted previously, but rooftop, soil, and various non-tarp categories have considerable overlap in their ratios of red:blue values, green:blue values, and red:green values.
+
+```{r, fig.width=8, out.width="100%"}
+#take a sample of 5000 points from the haiti data set
+set.seed(1)
+sample <- sample(nrow(haiti), 5000)
+haiti_sample <- haiti[sample,]
+
+#scatter plot grid with points colored by class
+featurePlot(x = haiti_sample[, 2:4], 
+            y = haiti_sample$Class, 
+            plot = "pairs",
+            auto.key = list(columns = 5))
+```
+
+Because some classes have substantial overlap, and because the most important objective is to identify blue tarps from all other points, I generated this same scatter plot matrix using the "tarp" classifier added to the dataframe previously, which collapsed all non-tarp pixels into a single category (shown below).
+
+```{r, fig.width=8}
+#scatter plot grid with points colored by class
+featurePlot(x = haiti_sample[, 2:4], 
+            y = haiti_sample$tarp, 
+            plot = "pairs",
+            auto.key = list(columns = 2))
+```
+
+
+In the scatter plots above, the decision boundaries between blue tarps and other pixels appear to be approximately linear. Also, the variance in color values and covariance between pairs of colors is not the same across all classes, particularly when non-tarp classes are considered separately (i.e., "vegetation," "soil," etc.)
+
+## Preparation for Model Comparison and Analysis
+
+Before starting the model-building process, I set trainControl parameters to be used by all models. These settings establish the use of 10-fold cross validation in creating models.
+```{r train_control, cache=TRUE}
+#set trainControl parameters to be used in all models
+trControl <- caret::trainControl(method='cv', number=10, 
+                                 savePredictions=TRUE, classProbs = TRUE, 
+                                 allowParallel = TRUE)
+```
+
+I also established an empty data frame to store key aspects of each model's characteristics and performance.
+
+```{r}
+columns <- c("Model", "Model Tuning Parameters", "AUC", "Threshold", 
+             "Accuracy", "Sensitivity/TPR", "FPR", "Precision")
+performance_table <- data.frame(matrix(nrow = 0, ncol = length(columns)))
+colnames(performance_table) <- columns
+```
+
+
+Finally, I built a function to help me more efficiently evaluate and compare different models and identify appropriate thresholds. Each time I call the function on one of my models, it will print a ROC curve and a table showing the model's 10-point cross-validated error and accuracy (assuming the default threshold of 0.5) and AUC. Finally, it will test a variety of threshold values so I can see accuracy, sensitivity, the false positive rate, and precision of the model as the threshold changes.
+
+```{r}
+#function to evaluate models
+evaluate_model <- function(model){
+  
+  #CV accuracy with threshold=0.5
+  accuracy <- model$results$Accuracy
+  
+  #CV prediction error estimate with threshold=0.5
+  error <- 1-model$results$Accuracy
+  
+  #AUC
+  #model$pred['tarp'] and model$pred['obs'] are the predicted prob and observed 
+  #values for the validation sets.
+  #Total number of values in model$pred is the number of observations multiplied
+  #by the number of combinations of tuneGrid parameters.
+  #So, to generate a ROC or AUC for a specific set of tune parameters, 
+  #you have to build a new model. 
+  #Otherwise it will include all suboptimal parameters!
+  rates <- prediction(model$pred['tarp'], model$pred['obs'])
+  auc_val<- performance(rates, measure="auc")
+  auc <- auc_val@y.values[[1]]
+  
+  #ROC
+  roc_result <- performance(rates, measure="tpr", x.measure="fpr")
+  plot(roc_result, main="ROC Curve")
+  lines(x=c(0,1), y=c(0,1), col="red")
+  
+  #threshold evaluation
+  threshold.stats <- thresholder(model, threshold=seq(0.05, 0.5, by=0.05), 
+                                 statistics="all")
+  threshold.stats$FPR <- 1-threshold.stats$Specificity #add FPR
+  
+  table <- threshold.stats %>%
+    select("prob_threshold","Accuracy", "Sensitivity", "FPR", "Precision", 
+           "Detection Prevalence")
+  print(table)
+  
+  return(tibble(CV_accuracy = accuracy, 
+                CV_error=error, AUC=auc))
+
+}
+```
+
+
+## Logistic Regression 
+
+The logistic regression model I built and tested included all three color values as individual predictors, since it appeared from the EDA that all three predictors would be important in separating classes. The summary output (below) showed that all three predictors were highly significant.
+
+```{r, warning=FALSE}
+#logistic regression
+set.seed(1)
+logistic <- train(tarp~Red+Green+Blue, data=haiti, 
+                  method ='glm', family='binomial', trControl=trControl)
+
+summary(logistic)
+```
+
+As shown in the outputs below, this model had very high prediction accuracy (99.52%), low prediction error (0.48%), and an AUC close to 1 (0.998). The ROC curve confirms that the model overall performs very well, as the curve is far from the diagonal line and close to the upper left corner.
+```{r}
+evaluate_model(logistic)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#Using the base R method returns the same logistic regression model and deviance, but a different estimate of the CV prediction error. This is because carat splits training/testing sets using stratified sampling, which takes the outcome into account.
+
+glm.fit1 <- glm(tarp~Red+Green+Blue, data=haiti, family=binomial)
+summary(glm.fit1)$deviance
+
+set.seed(1)
+error1=cv.glm(haiti,glm.fit1,K=10)$delta[1]
+error1
+```
+ 
+Because the purpose of this model is to find as many people under blue tarps as possible, I determined that misidentifying a pixel as a blue tarp when it was something else would be less consequential than mididentifying a tarp as something else when it is really a blue tarp; that is, in this circumstance, a false negative is much more problematic than a false positive, since false negatives could cost people their lives. 
+
+Looking at the table of performance metrics at different threshold values, we can see that at a threshold of P=0.05, model sensitivity is 0.976, which means that 97.6% of blue tarps would be identified, and those people using them could receive aid. The false positive rate at this threshold is at its peak - 0.013 or 1.3%, and precision is at its lowest point - 0.717 or 71.7%. This means that some pixels would be misidentified as tarps when they are not, but again, this is less consequential than missing some tarps, which could cost lives. Finally, even with a threshold set at P=0.05, overall model accuracy is still 98.7% (with a corresponding error of 1.3%), which is only slightly lower than peak model accuracy of 99.5% when the threshold is set at P=0.5. 
+
+I tested some additional thresholds below p=0.05 to see if I could make the model even more sensitive without compromising overall accuracy and precision too much. Those results are below. At P=0.005, the sensitivity went to 99.7%, but precision dropped to about 31.9%, which means that the majority of the pixels identified as tarps would actually be something else. Unsurprisingly, detection prevalence also rose considerably, to approximately 10%. If resources and aid workers were in limited supply, I would be concerned about misidentifying too many tarp pixels, as they would detract attention and time from the pixels that were truly tarps. Thus, given that a threshold of P=0.05 correctly captured 97.6% of blue tarps and still maintained a much higher precision, I chose to keep the threshold at P=0.05 for this model.
+
+```{r}
+ threshold.stats <- thresholder(logistic, threshold=seq(0.005, 0.05, by=0.005), 
+                                 statistics="all")
+  threshold.stats$FPR <- 1-threshold.stats$Specificity #add FPR
+  
+  table <- threshold.stats %>%
+    select("prob_threshold","Accuracy", "Sensitivity", "FPR", "Precision", 
+           "Detection Prevalence")
+  print(table)
+```
+
+Key model characteristics and metrics were saved for reference later.
+
+```{r}
+#insert all key metrics into performance data frame
+
+logisticinfo <- data.frame("Logistic regression", "predictors=3", 
+                           0.998, 0.05, 0.987, 0.976, 0.013, 0.717)
+colnames(logisticinfo) <- columns
+performance_table <- rbind(performance_table, logisticinfo)
+
+```
+
+
+## Linear Discriminant Analysis
+
+The LDA model I built and tested included all three color values as individual predictors, since it appeared from the EDA that all three predictors would be important in separating classes.
+
+```{r}
+#LDA
+set.seed(1)
+lda <- train(tarp~Red+Green+Blue, data=haiti, 
+                  method ='lda', trControl=trControl)
+
+lda$finalModel
+
+```
+
+As shown in the outputs below, this model had very high prediction accuracy (98.39%), low prediction error (1.61%), and an AUC close to 1 (0.989), though all three of these values are slightly lower than the corresponding values seen for the logistic regression. The ROC curve confirms that the model overall performs very well, though consistent with other slightly worse performance metrics, it cuts away from the upper left corner as compared to the ROC curve for the logistic regression.
+
+```{r}
+evaluate_model(lda)
+```
+
+When one class is rare compared to the other, the accuracy can be a misleading indicator of overall model performance, and in a closer examination of metrics across different thresholds, it is clear that this model's performance is substantially worse than the logistic regression. As before, if we want to prioritize sensitivity to help as many people as possible, we can only achieve a maximum sensitivity of 0.860 at P=0.05 with this model; this means that we would only be expected to detect about 86% of all tarp pixels. As before, I tried some additional, lower thresholds to see if I could improve the sensitivity (shown below).
+
+Even with the threshold lowered to P=0.001, the sensitivity only reached 93.6%, and at this threshold, precision was only 30.8%, which means that a majority of pixels identified as tarps would actually be something else. I ultimately selected a threshold of P=0.005; this yielded a sensitivity of 89.4%, but also a precision of 51.7%. Setting the threshold this low would mean that the detection prevalence is about 5.54%, which is higher than the detection prevalence for the threshold I selected for the logistic regression above (about 4.36%). If resources and personnel were readily available to invesitgate all identified tarp pixels, I would probably choose to lower this threshold further and increase sensitivity, with the recognition that this would dramatically increase the number of pixels identified (many erroneously) as tarps.
+
+```{r}
+threshold.stats <- thresholder(lda, threshold=seq(0.001, 0.01, by=0.001), 
+                                 statistics="all")
+  threshold.stats$FPR <- 1-threshold.stats$Specificity #add FPR
+  
+  table <- threshold.stats %>%
+    select("prob_threshold","Accuracy", "Sensitivity", "FPR", "Precision", 
+           "Detection Prevalence")
+  print(table)
+
+```
+
+I saved key metrics in my data frame for later use.
+
+```{r}
+#insert all key metrics into performance data frame
+
+ldainfo <- data.frame("LDA", "predictors=3", 
+                      0.989, 0.005, 0.970, 0.894, 0.028, 0.517)
+colnames(ldainfo) <- columns
+performance_table <- rbind(performance_table, ldainfo)
+```
+
+
+## Quadratic Discriminant Analysis
+
+The QDA model I built and tested included all three color values as individual predictors, since it appeared from the EDA that all three predictors would be important in separating classes.
+
+```{r}
+#QDA
+set.seed(1)
+qda <- train(tarp~Red+Green+Blue, data=haiti, 
+                  method ='qda', trControl=trControl)
+
+qda$finalModel
+```
+
+As shown in the outputs below, this model had very high prediction accuracy (99.46%), low prediction error (0.54%), and an AUC close to 1 (0.998). This model outperformed the LDA model and was comparable to the logistic regression model. The ROC curve confirms that the model overall performs very well, as the curve is far from the diagonal line and close to the upper left corner.
+
+```{r}
+evaluate_model(qda)
+```
+Looking through the list of possible thresholds, P=0.05 showed the highest sensitivity (94.01%) and still had a very low false positive rate (1.02%) and high precision (75.33%). I tried a few more (lower) threshold values to see if I could improve sensitivity further without compromising the precision too much. This output is shown below. As has been the case in other models, there is a clear tradeoff between increasing sensitivity and increasing precision. I selected a threshold of P=0.025, which gave a sensitivity of 98.37%, a precision of 64.15%, and a detection prevalence of 4.91%. As was true with the logistic model, this model has the potential to have a very high sensitivity if the threshold is lowered enough, and this model's precision does not suffer quite as much at very low thresholds, compared to the logistic regression.
+
+```{r}
+threshold.stats <- thresholder(qda, threshold=seq(0.005, 0.05, by=0.005), 
+                                 statistics="all")
+  threshold.stats$FPR <- 1-threshold.stats$Specificity #add FPR
+  
+  table <- threshold.stats %>%
+    select("prob_threshold","Accuracy", "Sensitivity", "FPR", "Precision", 
+           "Detection Prevalence")
+  print(table)
+```
+
+I saved key metrics in my data frame for later use.
+
+```{r}
+#insert all key metrics into performance data frame
+
+qdainfo <- data.frame("QDA", "predictors=3", 
+                      0.998, 0.025, 0.982,	0.984,	0.018,	0.642)
+colnames(qdainfo) <- columns
+performance_table <- rbind(performance_table, qdainfo)
+```
+
+## K-Nearest Neighbor
+
+For K-nearest neighbor, I again used all three predictors. I used carat's train function to test values of k between 3 and 15. The value of k that minimized cross validation error was k=7.  
+
+```{r knn, warning=FALSE, cache=TRUE, dependson="train_control"}
+
+#determine number of cores and initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#define range of k to explore
+kvals <- seq(3, 15, by=2)
+
+#set tuneGrid
+tuneGrid <- expand.grid(k=kvals)
+
+knn <- train(tarp~Red+Green+Blue, data=haiti, method ='knn', 
+             preProcess = c("center","scale"), #data must be normalized
+             trControl=trControl, tuneGrid=tuneGrid) 
+
+knn
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+The benefit to using carat for the knn model is that it returns probabilities of being a tarp for each data point, and therefore I was able to generate a ROC curve and a corresponding AUC value. However, in evaluating my KNN model with my evaluate_model function (below), I realized that the AUC value was the same for all values of k, which made me suspect that while CV accuracy and CV error were specific to a certain value of k, the ROC curve and corresponding AUC value was an average over all values of k in the tuning grid. 
+
+```{r}
+evaluate_model(knn)
+```
+Therefore To generate a ROC curve and AUC unique to the specific selected value of k, I rebuilt the model with k=7, to see a ROC curve and AUC specific to this value. 
+
+```{r knn_final, cache=TRUE, dependson= "train_control"}
+set.seed(1)
+
+#set tuneGrid
+tuneGrid <- expand.grid(k=7)
+
+knn_final <- train(tarp~Red+Green+Blue, data=haiti, method ='knn', 
+             preProcess = c("center","scale"), #data must be normalized
+             trControl=trControl, tuneGrid=tuneGrid) 
+
+```
+
+
+As shown in the outputs below, for k=7, this model had very high prediction accuracy (99.73%), low prediction error (0.27%), and an AUC close to 1 (0.999). The ROC curve confirms that the model overall performs very well, as the curve is far from the diagonal line and close to the upper left corner. As compared to the other two high performing models (logistic regression and QDA), this model is even better.
+
+```{r}
+evaluate_model(knn_final)
+```
+
+Looking at the various probability thresholds above, at P=0.05, the sensitivity is 99.80%, with a corresponding precision that is also quite good compared to other models, at 78.72%. This indicates that this model would identify almost all blue tarps, and that more than three quarters of pixels identified as tarps would actually be tarps. In a situation where aid workers and/or resources were limited, decreasing the threshold to 0.10 would still give a sensitivity of 98.57%, the precision would be 88.67%, and the detection rpevalence would be only 3.55%. Because I would expect resources to be constrained in a diaster situation, I selected 0.10 as the threshold, and saved key metrics in my data frame.
+
+```{r}
+#insert all key metrics into performance data frame
+
+knninfo <- data.frame("KNN", "predictors=3; k=7", 
+                      0.998, 0.10, 0.996,	0.986,	0.004,	0.887)
+colnames(knninfo) <- columns
+performance_table <- rbind(performance_table, knninfo)
+```
+
+
+## Penalized Logistic Regression (Ridge Regression)
+
+For the penalized logistic regression model, I chose ridge regression, given that there were few predictors to begin with, and all showed a strong relationship with pixel identification. I fit the model using all three color values as predictors, as in other models. I set a range of $\lambda$ values to try, and the model selected $\lambda$ = 0.003981072. It was noteworthy that the accuracy for all values below $\lambda$ = 0.01 was 97.79%, and accuracy was slightly lower (96.80%) for all $\lambda$ values 0.01 or greater. The higher accuracy for all values very close to 0 suggests to me that a shrinkage penalty may not substantially improve predictive ability beyond the regular logistic regression (where $\lambda = 0$).
+
+```{r}
+set.seed(1)
+
+#define range of lambdas to explore
+lambdas <- 10^seq(1, -3, by=-0.2)
+
+#set tuneGrid
+tuneGrid <- expand.grid(alpha=0, lambda=lambdas)
+
+#build ridge regression model
+ridge <- train(tarp~Red+Green+Blue, data=haiti, method ='glmnet', 
+             trControl=trControl, tuneGrid=tuneGrid) 
+
+ridge
+```
+
+As with the KNN model, since I wanted to see a ROC curve and AUC corresponding to only the best value of $\lambda$, I rebuilt this model using only the optimized value.
+
+```{r}
+#set tuneGrid
+tuneGrid <- expand.grid(alpha=0, lambda=0.003981072)
+
+#build ridge regression model
+ridge_final <- train(tarp~Red+Green+Blue, data=haiti, method ='glmnet', 
+             trControl=trControl, tuneGrid=tuneGrid) 
+```
+
+
+```{r, include = FALSE}
+evaluate_model(ridge)
+#note the dramatically different AUC and ROC; clearly an average of all the tuning parameters
+```
+
+
+```{r}
+evaluate_model(ridge_final)
+```
+
+When I looked at performance of this model (above), cross-validated prediction accuracy was 97.79%, and the corresponding prediction error was 2.21%. The ROC curve has a pronounced dip in the upper left corner, though the AUC was still quite high, at 0.980. 
+
+As I lowered the probability threshold to P=0.05, overall accuracy and precision dropped substantially, and sensitivity peaked at 89.47%. I tried some additional, lower threshold values (below). Though it was possible to improve sensitivity, the precision was extremely poor. Therefore, I settled on a threshold of P=0.10, as a compromise between sensitivity (81.50%) and precision (64.48%). Obviously many tarps would be missed with this model, so if resources were abundant to further investigate pixels identified as tarps, I would lower the threshold, even though it would come at the expense of dramatically reducing precision and increasing detection prevalence.
+
+```{r}
+threshold.stats <- thresholder(ridge_final, threshold=seq(0.005, 0.05, by=0.005), 
+                                 statistics="all")
+  threshold.stats$FPR <- 1-threshold.stats$Specificity #add FPR
+  
+  table <- threshold.stats %>%
+    select("prob_threshold","Accuracy", "Sensitivity", "FPR", "Precision", 
+           "Detection Prevalence")
+  print(table)
+```
+
+I saved key metrics in my summary data frame.
+
+```{r}
+#insert all key metrics into performance data frame
+
+ridgeinfo <- data.frame("Ridge regression", "predictors=3; lambda=0.00398", 
+                      0.980, 0.10, 0.980,	0.815, 0.015,	0.645)
+colnames(ridgeinfo) <- columns
+performance_table <- rbind(performance_table, ridgeinfo)
+```
+
+
+## Random Forest
+
+I fit a random forest model including all three color values as possible predictors, as in other models. In building this model, I varied two tuning parameters: the number of predictors considered at each node (m=1 or m=2), and the total number of trees (1-100). For the number of predictors at each node, I did not try m=3, as there were only three total predictors. For the number of trees, I chose this relatively low range of values based on some preliminary runs of this chunk of code, in which the default setting for ntree (500) did not produce a substantially superior accuracy as compared to a ntree value below 40. Setting ntree to very high values took a much longer time to run, and since it did not appear to offer any substantive advantage, I restricted my exploration to this handful of lower values. 
+
+```{r random_forest, cache=TRUE, dependson="train_control"}
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+#define range of tuning parameters to explore
+mtry <- c(1,2)
+ntrees <- c(1, 20, 40, 60, 80, 100) 
+
+params <- expand.grid(mtry = mtry, ntrees = ntrees)
+
+#create a vector to store accuracy for each set of parameters
+accuracy <- rep(0, nrow(params))
+
+#build random forest for all values of mtry and ntree
+for (i in 1:nrow(params)){
+  mtry = params[i,1]
+  ntree <- params[i,2]
+
+  #set tuneGrid
+  tuneGrid <- expand.grid(mtry=mtry)
+  
+  #build model
+  set.seed(1)
+  rf <- train(tarp~Red+Green+Blue,data = haiti, method = "rf", importance=TRUE, 
+              trControl=trControl, tuneGrid = tuneGrid, ntree = ntree)
+  
+  #store accuracy
+  accuracy[i] <-  rf$results[1,2]
+}
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+```{r}
+#view results and choose the optimal set of tuning parameters
+
+results <- data.frame(params, accuracy)
+results
+
+```
+As shown in the table above, the best combinations of tuning parameters are either m=1, ntree=40 (with an accuracy of 99.70%) or m=1, ntree=80 (with an accuracy of 99.70%). Since the computation time will be much shorter with only 40 trees, I chose ntree=40 for my final model. I created a new model using these optimal tuning parameters. 
+
+```{r random_forest_final}
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+#set tuneGrid
+tuneGrid <- expand.grid(mtry=1)
+
+#build random forest model
+set.seed(1)
+rf_final <- train(tarp~Red+Green+Blue,data = haiti, method = "rf", importance=TRUE, 
+              trControl=trControl, tuneGrid = tuneGrid, ntree = 40)
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+```{r}
+evaluate_model(rf_final)
+```
+When I looked at performance of this model (above), cross-validated prediction accuracy was 99.70%, and the corresponding prediction error was 0.30%. The ROC curve comes very close to the upper left corner, and the AUC was 0.999 - the highest yet, and nearly 1, which is the maximum possible. 
+
+At probability thresholds below 0.5, sensitivity increased and precision declined. Peak sensitivity (99.60%) was reached at P=0.05, but precision was only 77.08 at this threshold. As with past models, I sought to balance sensitivity with precision, with the recognition that resources would likely be limited. I settled on a threshold of 0.15, which gave a sensitivity of 98.52%, a precision of 88.76%, and a detection prevalence of 3.56%. Given the high sensitivity and precision, this model is on par with the k-nearest neighbors model. 
+
+I saved key metrics in my summary data frame.
+
+```{r}
+#insert all key metrics into performance data frame
+
+rfinfo <- data.frame("Random forest", "predictors=3; mtry=1; ntree=40", 
+                      0.999, 0.15, 0.995,	0.985, 0.004,	0.888)
+colnames(rfinfo) <- columns
+performance_table <- rbind(performance_table, rfinfo)
+```
+
+## Support Vector Machine
+
+I tried three different support vector machines, each using a different kernel (linear, polynomial, and radial basis function). For all three of these models, I incorporated all three predictors (as in all other models) and tuned the cost parameter. For the polynomial kernel, I also tuned the degree of the polynomial, and for the radial basis function kernel, I also tuned the sigma parameter. 
+
+```{r svm_linear, cache=TRUE, dependson="train_control"}
+
+#SVM with linear kernel
+
+#set range of cost values to try
+cost <- c(0.01, 0.1, 0.5, 1, 5, 10)
+
+#set tuneGrid
+tuneGrid <- expand.grid(C = cost)
+
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_linear <- train(tarp~Red+Green+Blue, data=haiti, method ='svmLinear', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+svm_linear
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+According to the above output, the best corss-validated prediction accuracy obtained by a linear kernel with an optimized cost = 0.5 was 99.54%. I rebuilt this model with its optimized cost parameter for further evaluation.
+
+```{r svm_linear_final, cache=TRUE, dependson="train_control"}
+#set tuneGrid
+tuneGrid <- expand.grid(C = 0.5)
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_linear_final <- train(tarp~Red+Green+Blue, data=haiti, method ='svmLinear', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+```{r}
+evaluate_model(svm_linear_final)
+```
+
+The SVM with linear kernel had an AUC value of 0.997. To attain high sensitivity of 97.23%, the threshold has to be lowered to 0.05, and at this threshold, the precision is a relatively low 66.62% and detection prevalence is 4.67%. Detecting this many "tarp" points - many of which would be erroneously identified - could considerably strain resources. Next, I tried a polynomial kernel to see if I could improve upon these results.
+
+```{r svm_poly, warning=FALSE, cache=TRUE, dependson="train_control"}
+#SVM with polynomial kernel
+
+#set range of parameter values to try
+cost <- c(0.1, 0.5, 1)
+degree <- c(2, 3, 4)
+scale <- c(0.001, 0.01, 0.1, 1)
+
+#set tuneGrid
+tuneGrid <- expand.grid(C = cost, degree = degree, scale = scale)
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_poly <- train(tarp~Red+Green+Blue, data=haiti, method ='svmPoly', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+svm_poly
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+Of the tuning parameters I evaluated with this kernel, the best prediction accuracy (99.66%) was achieved with a fourth degree polynomial, with cost = 1 and scale = 1. The same high accuracy was also achieved with a fourth degree polynomial with cost = 0.5 and scale =1. Nonetheless, I selected the parameters that the output identified and rebuilt the final version of this model for subsequent evaluation.
+
+```{r svm_poly_final, warning=FALSE, cache=TRUE, dependson="train_control"}
+
+#set tuneGrid
+tuneGrid <- expand.grid(C = 1, degree = 4, scale = 1)
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_poly_final <- train(tarp~Red+Green+Blue, data=haiti, method ='svmPoly', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+```{r}
+evaluate_model(svm_poly_final)
+```
+As seen in the above output, the polynomial kernel with optimized tuning parameters has an AUC of 0.9997, a cross-validated prediction accuracy of 99.67%, and a prediction error of 0.33%. The ROC curve reflects this high performance and comes very close to the upper left corner of the plot. At a probability threshold of 0.1, the sensitivity is 98.02% and the precision is	90.54%. This model not only outperforms the linear kernel, but also the other models that have been evaluated thus far. The last kernel I tried was the radial basis function kernel.
+
+```{r svm_radial, warning=FALSE, cache=TRUE, dependson="train_control"}
+#SVM with radial basis function kernel
+
+#set range of parameter values to try
+cost <- c(0.1, 0.5, 1)
+sigma <- c(0.01, 0.1, 1)
+
+#set tuneGrid
+tuneGrid <- expand.grid(C = cost, sigma = sigma)
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_radial <- train(tarp~Red+Green+Blue, data=haiti, method ='svmRadial', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+svm_radial
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+The output above indicates that the optimal tuning parameters are cost = 1 and sigma = 1, so I rebuilt this model with optimal tuning parameters for further evaluation.
+
+```{r svm_radial_final, warning=FALSE, cache=TRUE, dependson="train_control"}
+#set tuneGrid
+tuneGrid <- expand.grid(C = 1, sigma = 1)
+
+#initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+set.seed(1)
+
+#build model
+svm_radial_final <- train(tarp~Red+Green+Blue, data=haiti, method ='svmRadial', 
+             trControl=trControl, tuneGrid = tuneGrid)
+
+svm_radial_final
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+
+```{r}
+evaluate_model(svm_radial_final)
+```
+
+The AUC for this model was 0.9996, with a cross-validated prediction accuracy of 99.64% and a corresponding prediction error rate of 0.36%. This model's performance is very strong relative to the others, and is comparable to both the KNN model and the random forest model. At a threshold of 0.05, the sensitivity is 98.32% and precision is 89.36%. Since this model very slightly underperfoms the polynomial kernel and I wanted to choose just one SVM model for comparison to others, I decided to keep the polynomial kernel as my representative SVM model. Thus, I saved the optimized tuning parameters and performance metrics for the polynomial kernel in my summary data frame.
+
+```{r}
+#insert all key metrics into performance data frame
+
+svminfo <- data.frame("Support vector machine", 
+                      "predictors=3; kernel=polynomial; cost=1; degree=4; scale=1", 
+                      0.9997, 0.10, 0.996,	0.980,	0.003,	0.905)
+
+colnames(svminfo) <- columns
+performance_table <- rbind(performance_table, svminfo)
+```
+
+
+## Performance Table
+
+A summary of model performance is shown in the below table. Accuracy, Sensitivity, FPR, and Precision are for the given threshold value. 
+
+```{r}
+performance_table
+```
+## Holdout Data Wrangling and EDA
+
+For each of the eight test data files, I imported the file, taking care to omit header rows and select relevant columns as needed. I added a tarp column that identified the pixel as either "tarp" or "other," which I inferred from the file names.
+
+Because color value columns were not labeled, I had to make a determination about which column corresponded to which color. I did this by comparing density plots of each column to those in the EDA section for the training data. If pixels came from a "tarp" file, I compared color value density curves to those for tarps in the training set. If they came from a "non-tarp" file, I compared color value density curves to those for "other" pixels in the training set. 
+
+```{r}
+#Import data file #1
+
+tarp1 <- read_table('orthovnir067_ROI_Blue_Tarps_data.txt', skip=1, col_names=FALSE)
+
+#add class label, change it to factor
+
+tarp1$tarp <- rep('tarp', nrow(tarp1))
+tarp1$tarp <- factor(tarp1$tarp)
+```
+
+
+```{r}
+#Column identification for data file #1
+
+#long pivot for side-by-side plots
+
+long_tarp1 <- tarp1[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_tarp1, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #1")
+```
+
+Comparing these density curves to those for tarp pixels in the training set, I believe X3 most clearly corresponds to blue. Neither of the other two plots clearly resemble the red or green values for training set tarp pixels, but since green values tended to be a little higher than red values, I assigned X2 to green and X1 to red.
+
+```{r}
+tarp1 <- tarp1%>%
+  rename(Red=X1, Green=X2, Blue=X3)
+```
+
+```{r}
+#Import data file #2
+
+tarp2 <- read_table('orthovnir078_ROI_Blue_Tarps.txt', skip=8, col_names=FALSE)
+
+#select last three columns
+tarp2 <- tarp2%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+tarp2$tarp <- rep('tarp', nrow(tarp2))
+tarp2$tarp <- factor(tarp2$tarp)
+```
+
+```{r}
+#Column identification for data file #2
+
+#long pivot for side-by-side plots
+
+long_tarp2 <- tarp2[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_tarp2, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #2")
+```
+
+None of these density curves resemble those for color values for blue tarp pixels in the training set; nonetheless, I assigned the curve with the highest values (X10) to blue, the curve with second highest values (X9) to green, and lowest values (X8) to red.
+
+```{r}
+tarp2 <- tarp2%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+
+```{r}
+#Import data file #3
+
+tarp3 <- read_table('orthovnir069_ROI_Blue_Tarps.txt', skip=8, col_names=FALSE)
+
+#select last three columns
+tarp3 <- tarp3%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+tarp3$tarp <- rep('tarp', nrow(tarp3))
+tarp3$tarp <- factor(tarp3$tarp)
+```
+```{r}
+#Column identification for data file #3
+
+#long pivot for side-by-side plots
+
+long_tarp3 <- tarp3[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_tarp3, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #3")
+```
+
+The density plot for X10 most clearly corresponded to the training set's blue density curve. As with the previous two files, I assigned X9 to green and X8 to red because values were slightly higher in X9, and this more closely matched green color values in the training set.
+
+```{r}
+tarp3 <- tarp3%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+```{r}
+#Import data file #4
+
+tarp4 <- read_table('orthovnir067_ROI_Blue_Tarps.txt', skip=8, col_names=FALSE)
+
+#select last three columns
+tarp4 <- tarp4%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+tarp4$tarp <- rep('tarp', nrow(tarp4))
+tarp4$tarp <- factor(tarp4$tarp)
+```
+```{r}
+#Column identification for data file #4
+
+#long pivot for side-by-side plots
+
+long_tarp4 <- tarp4[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_tarp4, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #4")
+```
+
+Once more, the column X10 most closely matches the training set for blue, X9 most closely matches to green, and X8 most closely matches to red. It also makes sense that labeling would be consistent among all these files, though I did not want to assume this would be the case.
+
+```{r}
+tarp4 <- tarp4%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+
+```{r}
+#Import data file #5
+
+other1 <- read_table('orthovnir057_ROI_NON_Blue_Tarps.txt',
+                     skip=8,col_names=FALSE)
+
+#select last three columns
+other1 <- other1%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+other1$tarp <- rep('other', nrow(other1))
+other1$tarp <- factor(other1$tarp)
+
+```
+```{r}
+#Column identification for data file #5
+
+#long pivot for side-by-side plots
+
+long_other1 <- other1[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_other1, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #5")
+```
+
+These plots do not closely resemble those for non-tarp pixels in the training set. However, the spike in very high color values for column X8 leads me to believe that this column corresponds to red. Since X10 has the lowest values, I believe this corresponds to blue, and the slightly higher values of X9 compared to X10 lead me to believe it corresponds to green.
+
+```{r}
+other1 <- other1%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+
+```{r}
+#Import data file #6
+
+other2 <- read_table('orthovnir078_ROI_NON_Blue_Tarps.txt',
+                     skip=8,col_names=FALSE)
+
+#select last three columns
+other2 <- other2%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+other2$tarp <- rep('other', nrow(other2))
+other2$tarp <- factor(other2$tarp)
+
+```
+```{r}
+#Column identification for data file #6
+
+#long pivot for side-by-side plots
+
+long_other2 <- other2[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_other2, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #6")
+```
+
+As with the previous file, these plots do not closely resemble the training data, and show a very similar pattern to one another, making it difficult to distinguish between colors. Nonetheless, based on past precedent of other data files, the fact that the X8 column has the highest values and X10 has the lowest values, I assigned these columns in the same way as I have done for all other files.
+
+```{r}
+other2 <- other2%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+
+```{r}
+#Import data file #7
+
+other3 <- read_table('orthovnir069_ROI_NOT_Blue_Tarps.txt',
+                     skip=8,col_names=FALSE)
+
+#select last three columns
+other3 <- other3%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+other3$tarp <- rep('other', nrow(other3))
+other3$tarp <- factor(other3$tarp)
+
+```
+```{r}
+#Column identification for data file #7
+
+#long pivot for side-by-side plots
+
+long_other3 <- other3[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_other3, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #7")
+```
+
+
+From this set of plots, column X10 most clearly corresponds to blue, given the low density of high value points, but X8 and X9 are very similar to each other. I assigned X8 to red because it had slightly higher density at high values, and to be consistent with other files.
+
+```{r}
+other3 <- other3%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+
+```{r}
+#Import data file #8
+
+other4 <- read_table('orthovnir067_ROI_NOT_Blue_Tarps.txt',
+                     skip=8,col_names=FALSE)
+
+#select last three columns
+other4 <- other4%>%
+  select(X8, X9, X10)
+
+#add class label, change it to factor
+
+other4$tarp <- rep('other', nrow(other4))
+other4$tarp <- factor(other4$tarp)
+
+```
+```{r}
+#Column identification for data file #8
+
+#long pivot for side-by-side plots
+
+long_other4 <- other4[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#density plots with color as facet wrap
+ggplot(long_other4, aes(x=Value)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot of Color Values - Data File #8")
+```
+
+Consistent with all other data files, I assigned column X8 to red, X9 to green, and X10 to blue, as those were the training data curves that most closely matched these distributions. 
+
+```{r}
+other4 <- other4%>%
+  rename(Red=X8, Green=X9, Blue=X10)
+```
+
+With all eight files imported, cleaned up, and consistently labeled, my next step was to join these eight files into a single test data set.
+
+```{r}
+test_final <- rbind(tarp1, tarp2, tarp3, tarp4, other1, other2, other3, other4)
+```
+
+Before testing my models on this data set, I did some additional EDA.
+
+```{r}
+summary(test_final)
+```
+The above summary shows that 18926/(18926+1989697) = 0.94% of the points were blue tarps (compared to 3.2% in the training set). The median color values are notably lower than those in the training set: 107 versus 163 for red, 91 versus 148 for green, and 66 versus 123 for blue.
+
+```{r}
+#long pivot for side-by-side plots
+
+long_test <- test_final[,1:4]%>%
+  pivot_longer(cols=-tarp, names_to = "Color", values_to = "Value")
+
+#boxplot with color as facet wrap
+ggplot(long_test, aes(x=tarp, y=Value)) +
+  geom_boxplot() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Class", y="Color Value", 
+       title = "Boxplot: Color Values for Blue Tarp versus Other, Test Set")
+```
+
+These boxplots show that, broadly speaking, the differences between tarp pixels and non-tarp pixels show the same pattern as was seen in the training set. Median blue and green color values tend to be higher in tarp pixels than non-tarp pixels, and median red color values are roughly comparable. As mentioned above, however, we again see that median color values are lower in the test set than in the training set, and the IQR is also much narrower in the test set than in the training set.
+
+```{r}
+#density plots with color as facet wrap
+p <- ggplot(long_test, aes(x=Value, color=tarp)) +
+  geom_density() +
+  facet_wrap(facets='Color', ncol=4, scales = 'free_y')+
+  labs(x="Color Value", y="Density", 
+       title = "Density Plot: Color Values for Blue Tarp versus Other, 
+       Test Set", color="Pixel Classification")
+
+#manually change the color of the lines
+p+scale_color_manual(values=c("blue", "black"))
+```
+
+Consistent with the density plots I generated for each individual test data file, these plots, which combine all the test data together, show some substantial differences as compared to the training set. While blue values have some overlap between tarp and non-tarp pixels, they are reasonably well separated between the two classes, as was also the case with the training set. The density curves for red overlap almost completely in the test set, and this was not the case in the training set. This leads me to believe that the models will underperform in the test data compared to the training data, given that red color values may be a poor predictor of class in the test set. Green values had considerable overlap in the training set, and this continues to be the case in the test set, though the shape of the density curves are somewhat different and are shifted toward lower values that in the training set. 
+
+## Model Testing
+
+To test the seven models I built on the holdout data, I wrote a function that takes the model and predetermined threshold as inputs, and using caret's confusionMatrix function, it generates a confusion matrix and returns accuracy, sensitivity, the false positive rate, and precision for the selected threshold. It also plots a ROC curve and computes the AUC for the model, which are more general model performance metrics independent of the selected threshold. 
+
+```{r}
+#function to test models
+test_model <- function(model, threshold){
+  prediction <- as.factor(ifelse(predict(model,
+                                         newdata=test_final,
+                                         type='prob')$tarp>threshold,
+                                 'tarp', 'other'))
+  
+  cm <- confusionMatrix(data=prediction, reference=test_final$tarp)
+  
+  print(cm$table)
+  
+  #AUC
+  preds <- predict(model, newdata=test_final, type='prob')$tarp 
+  rates <- prediction(preds, test_final$tarp)
+  auc_val <- performance(rates, measure='auc')
+  auc <- auc_val@y.values[[1]]
+  
+  #ROC (with downsampling, because test set is huge)
+  roc_result <- performance(rates, measure='tpr', x.measure='fpr')
+  plot(roc_result,  downsampling = 0.001, main='ROC Curve')
+  lines(x=c(0,1), y=c(0,1), col='red')
+  
+
+  return(tibble(AUC=auc,
+                threshold = threshold,
+                accuracy = cm$overall['Accuracy'], 
+                sensitivity = cm$byClass['Sensitivity'], 
+                FPR=(1-cm$byClass['Specificity']), 
+                precision = cm$byClass['Precision']))
+
+}
+```
+
+I also set up an empty data frame to store important metrics capturing each model's performance on the test data.
+
+```{r}
+columns <- c("Model", "AUC", "Threshold", 
+             "Accuracy", "Sensitivity/TPR", "FPR", "Precision")
+test_table <- data.frame(matrix(nrow = 0, ncol = length(columns)))
+colnames(test_table) <- columns
+```
+
+Using each of the seven candidate models and the final, aggregated holdout data set, I tested each model's performance on the test data set using the probability threshold that I specified as optimal for each model. I captured key performance metrics for each model in my test performance data frame.
+
+
+```{r, warning=FALSE}
+#Test the logistic model
+test_model(logistic, 0.05)
+
+```
+
+As the ROC and AUC show, this model performed very well on the test data set, with a ROC curve that came very close to the upper left corner and a AUC value of 0.999. At the threshold I set using training data (0.05), overall accuracy was 90.38% and the sensitivity was 99.99%. Though the overall accuracy was lower than on the training data, the sensitivity (99.99%) was better, indicating that virtually no tarps were missed. Unfortunately, the false positive rate and precision were substantially worse than on the training set, indicating that many points (more than 193,000!) were misidentified as tarps. The AUC and ROC suggest that this model has strong potential, and that it would be worthwhile to further tweak the threshold to reduce the number of false positives.
+
+I saved key metrics in my summary table.
+
+```{r}
+#insert all key metrics into test data frame
+
+logistic_test_info <- data.frame("Logistic regression", 
+                      0.999, 0.05, 0.904,	0.9999,	0.097,	0.089)
+
+colnames(logistic_test_info) <- columns
+test_table <- rbind(test_table, logistic_test_info)
+```
+
+```{r, warning=FALSE}
+#Test the LDA model
+test_model(lda, 0.005)
+```
+
+The LDA's AUC (0.992) was slightly lower than the logistic regression's, and its ROC curve did not come as close to the upper left corner. At the selected threshold of 0.005, overall accuracy was 96.35%, and sensitivity was 98.09%. The precision was still substantially lower than in the training set, at 20.26%, again indicated many points falsely misclassified as tarps.
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+lda_test_info <- data.frame("LDA", 
+                      0.992, 0.005, 0.963,	0.981,	0.037,	0.201)
+
+colnames(lda_test_info) <- columns
+test_table <- rbind(test_table, lda_test_info)
+```
+
+
+```{r, warning=FALSE}
+#Test the QDA model
+test_model(qda, 0.025)
+```
+
+The QDA's AUC is 0.992, and similar to the LDA ROC, it does not come as close to the upper left corner of the plot as compared to the logistic regression. The accuracy at the selected threshold of 0.025 is the highest we have seen thus far at 97.03%, though the sensitivity is much lower (92.32%) than the other two models. As the confusion matrix shows, this model misses quite a few tarp points, but also does not identify as many false positives. 
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+qda_test_info <- data.frame("QDA", 
+                      0.992, 0.025, 0.970,	0.923,	0.029,	0.231)
+
+colnames(qda_test_info) <- columns
+test_table <- rbind(test_table, qda_test_info)
+```
+
+```{r, warning=FALSE}
+#determine number of cores and initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+#Test the KNN model
+test_model(knn_final, 0.1)
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+The ROC curve did not render properly for this model, despite working well for logistic regression, LDA, QDA, ridge regression, and SVM. In troubleshooting the problem, I discovered that the downsampling argument of the plot function that did not work with certain models (KNN and random forests). To get around this issue and generate a usable ROC curve, I simply took a random sample of the holdout set and used this smaller data set to estimate a ROC curve.
+
+```{r}
+#create a mini test set of 5000 points
+
+set.seed(1)
+sample2 <- sample(nrow(test_final), 5000)
+mini_test <- test_final[sample2,]
+
+#ROC curve
+preds <- predict(knn_final, newdata=mini_test, type='prob')$tarp 
+rates <- prediction(preds, mini_test$tarp)
+roc_result <- performance(rates, measure='tpr', x.measure='fpr')
+plot(roc_result, main='ROC Curve')
+lines(x=c(0,1), y=c(0,1), col='red')
+
+```
+
+The AUC value of 0.970 was a bit lower for this model than for others thus far, and the ROC curve did not fit as neatly into the upper left corner of the plot as for logistic regression, which is the strongest (so far) in terms of ROC/AUC. The accuracy at the selected threshold of 0.1 was 98.57%, the sensitivity was 94.22%, and importantly, the precision was higher than other models, at 39.19%. There were some missed tarp pixels, but of those identified as tarps, a higher proportion were actually tarps. The precision is still far below what was seen with the training set, however. Though the KNN model was the top performer with the training data, its AUC did not match the overall performance of the logistic regression model when used with the test data.
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+knn_test_info <- data.frame("KNN", 
+                      0.970, 0.1, 0.986,	0.942,	0.014,	0.392)
+
+colnames(knn_test_info) <- columns
+test_table <- rbind(test_table, knn_test_info)
+```
+
+
+```{r, warning=FALSE}
+#Test the ridge model
+test_model(ridge_final, 0.1)
+```
+
+The AUC for the ridge regression model (0.988) is lower than for logistic regression, LDA, and QDA, but higher than for the KNN model. The corresponding ROC curve is farther from the upper left corner than was seen in logistic regression, LDA, and QDA. At the threshold of 0.1, sensitivity was only 83.60%, indicating that many tarp pixels were missed, and precision (25.68%) was not much better than in the logistic regression, LDA, and QDA. The ridge regression model's relatively low sensitivity was not surprising, given that this was also the case with the training data.
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+ridge_test_info <- data.frame("Ridge regression", 
+                      0.988, 0.1, 0.976,	0.836,	0.023,	0.257)
+
+colnames(ridge_test_info) <- columns
+test_table <- rbind(test_table, ridge_test_info)
+```
+
+```{r, warning=FALSE}
+#Test the random forest model
+test_model(rf_final, 0.15)
+```
+As was true with the KNN model, the downsampling argument of the plot function caused the ROC curve to render improperly, and I used the same method described above to generate a usable ROC curve.
+
+```{r}
+#ROC curve
+preds <- predict(rf_final, newdata=mini_test, type='prob')$tarp 
+rates <- prediction(preds, mini_test$tarp)
+roc_result <- performance(rates, measure='tpr', x.measure='fpr')
+plot(roc_result, main='ROC Curve')
+lines(x=c(0,1), y=c(0,1), col='red')
+```
+
+
+The AUC of 0.987 is comparable to the AUC of ridge regression, and is relatively low compared to better performing models (though not as low as the KNN model). The ROC curve cuts away a bit from the upper left corner. At the selected threshold of 0.15, the model's accuracy was 97.52%, sensitivity was 97.08%, and precision was 27.14%. 
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+rf_test_info <- data.frame("Random forest", 
+                      0.987, 0.15, 0.975,	0.971,	0.025,	0.271)
+
+colnames(rf_test_info) <- columns
+test_table <- rbind(test_table, rf_test_info)
+```
+
+```{r, warning=FALSE}
+#determine number of cores and initialize cluster
+no_cores <- detectCores()-1
+cl <- makePSOCKcluster(no_cores)
+registerDoParallel(cl)
+
+#Test the SVM model
+test_model(svm_poly_final, 0.1)
+
+#stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+This model's ROC curve came very close to the upper left corner of the plot, and the corresponding AUC value was 0.999, the same as the logistic regression model. At the selected threshold of 0.1, the sensitivity was 99.50% and the corresponding precision was 30.46%. For this level of sensitivity, the precision appears much better than the logistic regression, though as noted before, it would be worthwhile to further explore different thresholds for the logistic regession model. 
+
+I saved these metrics in my test performance data frame.
+
+```{r}
+#insert all key metrics into test data frame
+
+svm_test_info <- data.frame("Support vector machine (polynomial kernel)", 
+                      0.999, 0.1, 0.979,	0.995,	0.022,	0.305)
+
+colnames(svm_test_info) <- columns
+test_table <- rbind(test_table, svm_test_info)
+```
+
+## Holdout Set Performance Table
+
+A summary of model performance is shown in the below table. Tuning parameters for each model are in the original table (above). Accuracy, Sensitivity, FPR, and Precision are for the given threshold value. 
+
+```{r}
+test_table
+```
+
+## Conclusions
+
+When I trained the seven models described above, all had fairly high and similar AUC values, ranging from a low of 0.980 (ridge regression) to a high of 0.9997 (SVM model with polynomial kernel). Based on AUC values alone, the top performer was the SVM model, followed very closely by the random forest (0.9990), and then by the logistic regression, QDA, and KNN models (all 0.998). With such a tiny amount of variation among these top performers, the AUC alone seemed insufficient to distinguish them, and I largely relied on sensitivity and precision to further judge their performance, and to select a threshold for each model.
+
+As noted several times in the discussion throughout this report, sensitivity and precision seemed like logical metrics to consider, since they most directly reflect aid workers' ability to locate people needing help (sensitivity) without simultaneously being overwhelmed by false positives (precision). I also considered the related metric of detection prevalence (how many total pixels would be identified as tarps), since too high a number would easily overwhelm limited people and resources. Without knowing exactly how personnel and resources might be constrained, I attempted to balance these factors, and roughly aimed, where possible, for sensitivity of >97-98%, with corresponding precision >70%. However, threshold choices could be very different with additional information. For example, if misidentifying pixels as tarps placed undue strain on a very limited number of workers, and thereby prevented them from assessing pixels that were more unambiguously tarps, I would choose higher threshold values. Alternatively, if there were plenty of resources available to check out every pixel identified as a tarp, I might have further lowered the threshold for some models and increase the sensitivity further.
+
+Based on these criteria, the SVM model, random forest, and K-nearest neighbor models were the strongest performers with the training data. While logistic regression and QDA were also able to achieve a high level of sensitivity at certain thresholds, the SVM, random forest, and KNN models were able to do so with the highest corresponding precision. The SVM model's strong performance was likely due to the fact that the classes were reasonably well separated, as evident in the scatter plots. The original data set had only three predictors, so a polynomial kernel added some additional dimensions and flexibility, and ultimely helped in finding a highly accurate separating hyperplane. The random forest model's success was also unsurprising, given that the three predictors were highly correlated to each other, and random forests tend to perform well when this is the case. The SVM and random forest models also had no requirement about the distribution of the input data, which may have offered an advantage in this case. The strong performance of the KNN model was likely attributable to the large number of observations; KNN requires a large training set, and may not have performed as well on a smaller data set. 
+
+The relatively poor performance of LDA relative to QDA with the training data was unsurprising, given that the variance was not constant between classes, and this is required for LDA. It is similarly unsurprising that ridge regression performed relatively poorly, since this method is meant to reduce the contributions of less significant predictors. In this case, since there were so few predictors and they were all important, ridge regression offered little advantage.
+
+When I tested the models on the holdout data set, the first thing I noticed was that precision was comparatively poor across all models. Whereas precision was 88-91% among top performing models in the training set, it dropped to under 40% in the holdout set, and for some thresholds and models, was substantially lower than this. Given the size of the holdout set (>2 million pixels) and the low precision of the models, there were tens of thousands of false positives in some cases, and given my concerns about constrained resources, this seems unacceptably high. Thus, in a second iteration of training, I would likely consider raising the thresholds to reduce the number of false positives at the expense of some sensitivity. Nonetheless, in the present analysis, I used the thresholds I had identified during training to evaluate each model, along with the models' ROC curves and AUC scores.
+
+Looking at AUC scores, there was marginally more variation with the holdout data than was seen with the training data, and values did not follow the same pattern as was seen with training data. With the training set, the SVM and random forest were the top performers, followed by the logistic regression, QDA, and KNN models. With the holdout set, the two best models were the logistic regression and the SVM model (both 0.999), followed by the LDA and QDA models (both 0.992). The random forest had an AUC of 0.987 - comparable to the ridge regression - and the KNN model had the lowest AUC of all the models, at 0.970. 
+
+Looking more carefully at each model's performance with the threshold I identified, the logistic regression had outstanding sensitivity, detecting 99.99% of tarp pixels and exceeding its performance on the taining set, but had an abysmally low precision of only 8.9%. This would correspond to an untenable number of false positive pixels, but given that the AUC value for this model was so high, and it thus seemed to be a strong model overall, I think it would be worthwhile to continue tweaking this model with some different threshold values before rejecting it outright. The other model with the highest AUC score, the SVM model with the polynomial kernel, attained 99.5% sensitivity, which also exceeded its performance with the training data. Though the sensitivity is only slightly lower than the logistic regression, this model has a much improved precision of 30.5%. As noted above, this precision is perhaps still too low, but in further testing and tweaking of thresholds, I speculate that this model would offer the highet sensitivity for a given level of precision. It is therefore my top model, and the one I would choose to use in a real-world situation.
+
+The KNN and random forest models - both strong contenders based on the training sets - performed decently with the holdout data, though their sensitivity was slightly lower than was seen with the training data. While their sensitivities were not as high as the logistic regression or the SVM, the KNN model had considerably better precision (39.2%), and the random forest model had precision of 27.1% - not as strong as the SVM, but nowhere close to as bad as the logistic regression. The differences between sensitivity and precision among these mid-range performers are likely due in part to varying threshold values. 
+
+In considering the performance of these models, it is worthwhile to note that there were some substantial differences between the training and testing data sets, which became apparent during the import and density plot assessment for the test data files. Some files contined data that were more similar to the training set than others, but generally speaking, color values were lower in the holdout set than in the training set, and the density plots for each color looked different for the training and holdout sets. For instance, red color values were a valuable predictor of class in the training data, but classes had much more overlap in the test data, and red color value was therefore not as informative as a predictor for the holdout set. Though some of the models performed very well with the testing data despite these differences, I speculate that the lower overall precision may be, in part, due to differently distributed training and holdout sets. To mitigate this issue, one possible strategy I could try would be to engineer a feature that represents each color value as a proportion of the total for that pixel; that is, for each pixel, what proportion of its total color score is red, green, and blue? This may help to control for the overall darkness of an image. I might also consider whether different models would be needed to assess darker versus brighter images.
+
+In addition to changes mentioned in the above paragraphs, there are several other ideas I have to further improve these models. I could experiment more with adjusting the number of parameters. Early on, I did try different subsets of predictors, but quickly discovered that all three color values were important, so reducing to fewer predictors did not make sense. I also experimented with interactions, but the improvement in model performance was marginal at best. I did not attempt to build any polynomial terms into the models, and this could be an avenue for further exploration. I could also try a broader range of tuning parameters, particularly in the SVM models, which show the most promise based on current results. To further enhance the model's ability to correctly identify tarps, it would be interesting to factor a pixel's surrounding pixels into a model. A pixel that is surrounded by other "tarp" pixels is more likely to itself be a tarp than a pixel whose color values identify it as a tarp, but which is surrounded by "non-tarp" pixels. Finally, it would be interesting to try an approach that is known to excel with image recognition, such as a neural network. 
+
